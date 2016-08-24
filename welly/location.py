@@ -25,7 +25,7 @@ class Location(object):
         for k, v in params.items():
             if k and v:
                 try:
-                    setattr(self, k, float(v))
+                    setattr(self, k, float(v.replace(',', '')))
                 except:
                     setattr(self, k, v)
 
@@ -50,6 +50,19 @@ class Location(object):
             None.
         """
         self.crs = CRS.from_epsg(epsg)
+        return
+
+    def crs_from_string(self, string):
+        """
+        Sets the CRS using a PROJ4 string.
+
+        Args:
+            string (int): The PROJ4 string, eg '+init=epsg:4269 +no_defs'.
+
+        Returns:
+            None.
+        """
+        self.crs = CRS.from_string(string)
         return
 
     @classmethod

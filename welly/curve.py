@@ -53,7 +53,7 @@ class Curve(np.ndarray):
             return float(obj)
 
         self.start = getattr(obj, 'start', 0)
-        self.step = getattr(obj, 'step', 0)
+        self.step = getattr(obj, 'step', 1)
         self.mnemonic = getattr(obj, 'mnemonic', None)
         self.units = getattr(obj, 'units', None)
         self.run = getattr(obj, 'run', 0)
@@ -69,14 +69,28 @@ class Curve(np.ndarray):
         if self.size < 10:
             return np.ndarray.__repr__(self)
         attribs = self.__dict__.copy()
+
+        # Header.
         row1 = '<tr><th style="text-align:center;" colspan="2">{} [{{}}]</th></tr>'
         rows = row1.format(attribs.pop('mnemonic'))
         rows = rows.format(attribs.pop('units', '&ndash;'))
         row2 = '<tr><td style="text-align:center;" colspan="2">{:.4f} : {:.4f} : {:.4f}</td></tr>'
         rows += row2.format(attribs.pop('start'), self.stop, attribs.pop('step'))
+
+        # Curve attributes.
         s = '<tr><td><strong>{k}</strong></td><td>{v}</td></tr>'
         for k, v in attribs.items():
             rows += s.format(k=k, v=v)
+
+        # Curve stats.
+        rows += '<tr><th style="border-top: 2px solid #000; text-align:center;" colspan="2"><strong>Stats</strong></th></tr>'
+        stats = self.get_stats()
+        s = '<tr><td><strong>samples (NaNs)</strong></td><td>{samples} ({nulls})</td></tr>'
+        s += '<tr><td><strong><sub>min</sub> mean <sup>max</sup></strong></td>'
+        s += '<td><sub>{min:.2f}</sub> {mean:.3f} <sup>{max:.2f}</sup></td></tr>'
+        rows += s.format(**stats)
+
+        # Curve preview.
         s = '<tr><th style="border-top: 2px solid #000;">Depth</th><th style="border-top: 2px solid #000;">Value</th></tr>'
         rows += s.format(self.start, self[0])
         s = '<tr><td>{:.4f}</td><td>{:.4f}</td></tr>'
@@ -85,6 +99,11 @@ class Curve(np.ndarray):
         rows += '<tr><td>⋮</td><td>⋮</td></tr>'
         for depth, value in zip(self.basis[-3:], self[-3:]):
             rows += s.format(depth, value)
+
+        # Footer.
+        # ...
+
+        # End.
         html = '<table>{}</table>'.format(rows)
         return html
 
@@ -97,10 +116,20 @@ class Curve(np.ndarray):
         precision_adj = self.step / 100
         return np.arange(self.start, self.stop - precision_adj, self.step)
 
+    def get_stats(self):
+        stats = {}
+        stats['samples'] = self.shape[0]
+        stats['nulls'] = self[np.isnan(self)].shape[0]
+        stats['mean'] = float(np.nanmean(self))
+        stats['min'] = float(np.nanmin(self))
+        stats['max'] = float(np.nanmax(self))
+        return stats
+
     @classmethod
     def from_lasio_curve(cls, curve,
                          basis=None,
                          start=None,
+                         stop=None,
                          step=0.1524,
                          run=-1,
                          null=-999.25,
@@ -114,6 +143,7 @@ class Curve(np.ndarray):
             curve (ndarray)
             basis (ndarray)
             start (float)
+            stop (float)
             step (float): default: 0.1524
             run (int): default: -1
             null (float): default: -999.25
@@ -130,6 +160,12 @@ class Curve(np.ndarray):
             else:
                 raise CurveError("You must provide a basis or a start depth.")
 
+        if step == 0:
+            if stop is None:
+                raise CurveError("You must provide a step or a stop depth.")
+            else:
+                step = (stop - start) / (curve.data.shape[0] - 1)
+
         params = {}
         params['mnemonic'] = curve.mnemonic
         params['description'] = curve.descr
@@ -143,6 +179,14 @@ class Curve(np.ndarray):
         params['code'] = curve.API_code
 
         return cls(curve.data, params=params)
+
+    def get_alias(self, alias):
+        """
+        Given a mnemonic, get the alias name(s) it falls under. If there aren't
+        any, you get an empty list.
+        """
+        alias = alias or {}
+        return [k for k, v in alias.items() if self.mnemonic in v]
 
     def apply(self, function, **kwargs):
         """
@@ -296,9 +340,17 @@ class Curve(np.ndarray):
         lw = getattr(d, 'lineweight', None) or getattr(d, 'lw', 1)
         ls = getattr(d, 'linestyle', None) or getattr(d, 'ls', '-')
 
-        ax.set_title(self.mnemonic)
-        ax.set_xlabel(self.units)
         ax.plot(self, self.basis, c=c, lw=lw, ls=ls)
+        ax.set_title(self.mnemonic)  # no longer needed
+        ax.set_xlabel(self.units)
+
+        if False:  # labeltop of axes?
+            ax.xaxis.tick_top()
+
+        if True:  # rotate x-tick labels
+            labels = ax.get_xticklabels()
+            for label in labels:
+                label.set_rotation(90)
 
         ax.set_ylim([self.stop, self.start])
         ax.grid('on', color='k', alpha=0.2, lw=0.25, linestyle='-')
@@ -310,6 +362,8 @@ class Curve(np.ndarray):
         else:
             return None
 
+    def extrapolate(self):
+        return utils.extrapolate(self)
 
     def to_basis_like(self, basis):
         """
@@ -330,20 +384,23 @@ class Curve(np.ndarray):
             undefined = curve.null
         except:
             undefined = None
-        start = basis[0]
-        step = basis[1] - basis[0]
-        stop = basis[-1]
 
-        return self.to_basis(start, stop, step, undefined=undefined)
+        return self.to_basis(basis=basis,
+                             undefined=undefined)
 
-    def to_basis(self, start=None, stop=None, step=None, undefined=None):
+    def to_basis(self, basis=None,
+                 start=None,
+                 stop=None,
+                 step=None,
+                 undefined=None):
         """
-        Make a new curve in a new basis, given a new start, step, and stop.
-        You only need to set the parameters you want to change. If the new
-        extents go beyond the current extents, the curve is padded with the
-        ``undefined`` parameter.
+        Make a new curve in a new basis, given a basis, or a new start, step,
+        and/or stop. You only need to set the parameters you want to change.
+        If the new extents go beyond the current extents, the curve is padded
+        with the ``undefined`` parameter.
 
         Args:
+            basis (ndarray)
             start (float)
             stop (float)
             step (float)
@@ -352,19 +409,19 @@ class Curve(np.ndarray):
         Returns:
             Curve. The current instance in the new basis.
         """
-        new_start = start or self.start
-        new_step = step or self.step
-        new_stop = stop or self.stop
+        if basis is None:
+            new_start = start or self.start
+            new_step = step or self.step
+            new_stop = stop or self.stop
+            new_adj_stop = new_stop + new_step/100  # To guarantee inclusion.
+            basis = np.arange(new_start, new_adj_stop, new_step)
+        else:
+            new_start = basis[0]
+            new_step = basis[1] - basis[0]
 
-        if undefined is None:
-            undefined = np.nan
-        undefined = {'left': undefined,
-                     'right': undefined
-                     }
+        undefined = {'left': undefined or np.nan, 'right': undefined or np.nan}
 
-        new_adj_stop = new_stop + new_step/100  # To guarantee inclusion.
-        new_basis = np.arange(new_start, new_adj_stop, new_step)
-        data = np.interp(new_basis, self.basis, self, **undefined)
+        data = np.interp(basis, self.basis, self, **undefined)
 
         params = self.__dict__.copy()
         params['step'] = float(new_step)
@@ -418,6 +475,95 @@ class Curve(np.ndarray):
             return np.array([self._read_at(depth, **kwargs) for depth in d])
         except:
             return self._read_at(d, **kwargs)
+
+    def quality(self, tests, alias=None):
+        """
+        Run a series of tests and return the corresponding results.
+
+        Args:
+            tests (list): a list of functions.
+
+        Returns:
+            list. The results. Stick to booleans (True = pass) or ints.
+        """
+        # Gather the tests.
+        # First, anything called 'all', 'All', or 'ALL'.
+        # Second, anything with the name of the curve we're in now.
+        # Third, anything that the alias list has for this curve.
+        # (This requires a reverse look-up so it's a bit messy.)
+        this_tests =\
+            tests.get('all', [])+tests.get('All', [])+tests.get('ALL', [])\
+            + tests.get(self.mnemonic, [])\
+            + utils.flatten_list([tests.get(a) for a in self.get_alias(alias=alias)])
+        this_tests = filter(None, this_tests)
+
+        return {test.__name__: test(self) for test in this_tests}
+
+    def qflag(self, tests, alias=None):
+        """
+        Run a test and return the corresponding results on a sample-by-sample
+        basis.
+
+        Args:
+            tests (list): a list of functions.
+
+        Returns:
+            list. The results. Stick to booleans (True = pass) or ints.
+        """
+        # Gather the tests.
+        # First, anything called 'all', 'All', or 'ALL'.
+        # Second, anything with the name of the curve we're in now.
+        # Third, anything that the alias list has for this curve.
+        # (This requires a reverse look-up so it's a bit messy.)
+        this_tests =\
+            tests.get('all', [])+tests.get('All', [])+tests.get('ALL', [])\
+            + tests.get(self.mnemonic, [])\
+            + utils.flatten_list([tests.get(a) for a in self.get_alias(alias=alias)])
+        this_tests = filter(None, this_tests)
+
+        return {test.__name__: test(self) for test in this_tests}
+
+    def qflags(self, tests, alias=None):
+        """
+        Run a series of tests and return the corresponding results.
+
+        Args:
+            tests (list): a list of functions.
+
+        Returns:
+            list. The results. Stick to booleans (True = pass) or ints.
+        """
+        # Gather the tests.
+        # First, anything called 'all', 'All', or 'ALL'.
+        # Second, anything with the name of the curve we're in now.
+        # Third, anything that the alias list has for this curve.
+        # (This requires a reverse look-up so it's a bit messy.)
+        this_tests =\
+            tests.get('all', [])+tests.get('All', [])+tests.get('ALL', [])\
+            + tests.get(self.mnemonic, [])\
+            + utils.flatten_list([tests.get(a) for a in self.get_alias(alias=alias)])
+        this_tests = filter(None, this_tests)
+
+        return {test.__name__: test(self) for test in this_tests}
+
+    def quality_score(self, tests, alias=None):
+        """
+        Run a series of tests and return the normalized score.
+            1.0:   Passed all tests.
+            (0-1): Passed a fraction of tests.
+            0.0:   Passed no tests.
+            -1.0:  Took no tests.
+
+        Args:
+            tests (list): a list of functions.
+
+        Returns:
+            float. The fraction of tests passed, or -1 for 'took no tests'.
+        """
+        results = self.quality(tests, alias=alias).values()
+        if results:
+            return sum(results) / len(results)
+        return -1
 
     def block(self,
               cutoffs=None,
@@ -485,42 +631,71 @@ class Curve(np.ndarray):
 
         return Curve(data, params=params)
 
-    def _rolling_window(self, window):
+    def _rolling_window(self, window_length, func1d, step=1, return_rolled=False):
         """
-        Private function. Smoother for the despiker to work on.
+        Private function. Smoother for other smoothing/conditioning functions.
 
         Args:
-            window (int): the window length.
+            window_length (int): the window length.
+            func1d (function): a function that takes a 1D array and returns a
+                scalar.
+            step (int): if you want to skip samples in the shifted versions.
+                Don't use this for smoothing, you will get strange results.
+
+        Returns:
+            ndarray: the resulting array.
         """
         # Force odd.
-        if window % 2 == 0:
-            window += 1
-        shape = self.shape[:-1] + (self.shape[-1] - window + 1, window)
-        strides = self.strides + (self.strides[-1],)
-        rolled = np.lib.stride_tricks.as_strided(self,
+        if window_length % 2 == 0:
+            window_length += 1
+
+        shape = self.shape[:-1] + (self.shape[-1], window_length)
+        strides = self.strides + (step*self.strides[-1],)
+        data = np.pad(self, step*(window_length//2), mode='edge')
+        rolled = np.lib.stride_tricks.as_strided(data,
                                                  shape=shape,
                                                  strides=strides)
-        rolled = np.median(rolled, -1)
-        rolled = np.pad(rolled, window//2, mode='edge')
+        result = np.apply_along_axis(func1d, -1, rolled)
 
-        return rolled
+        if return_rolled:
+            return result, rolled
+        else:
+            return result
 
-    def despike(self, window=33, z=2):
+    def despike(self, window_length=33, z=2):
         """
         Args:
             window (int): window length in samples. Default 33 (or 5 m for
-                most curves).
+                most curves sampled at 0.1524 m intervals).
             z (float): Z score
 
         Returns:
             Curve.
         """
         z *= np.std(self)  # Transform to curve's units
-        curve_sm = self._rolling_window(window)
+        curve_sm = self._rolling_window(window_length, np.median)
         spikes = np.where(self - curve_sm > z)[0]
         spukes = np.where(curve_sm - self > z)[0]
         out = np.copy(self)
         params = self.__dict__.copy()
         out[spikes] = curve_sm[spikes] + z
         out[spukes] = curve_sm[spukes] - z
+        return Curve(out, params=params)
+
+    def smooth(self, window_length, func1d=None):
+        """
+        Runs any kind of function over a window.
+
+        Args:
+            window_length (int): the window length. Required.
+            func1d (function): a function that takes a 1D array and returns a
+                scalar. Default: ``np.mean()``.
+
+        Returns:
+            Curve.
+        """
+        if func1d is None:
+            func1d = np.mean
+        params = self.__dict__.copy()
+        out = self._rolling_window(window_length, func1d)
         return Curve(out, params=params)

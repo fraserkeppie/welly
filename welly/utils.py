@@ -6,8 +6,41 @@ Utility functions for welly.
 :copyright: 2016 Agile Geoscience
 :license: Apache 2.0
 """
+import re
+import glob
+
 import numpy as np
 import matplotlib.pyplot as plt
+
+
+def null(x):
+    """
+    Null function. Used for default in functions that can apply a user-
+    supplied function to data before returning.
+    """
+    return x
+
+
+def null_default(x):
+    """
+    Null function. Used for default in functions that can apply a user-
+    supplied function to data before returning.
+    """
+    def null(y):
+        return x
+
+    return null
+
+
+def skip(x):
+    """
+    Always returns None.
+    """
+    return
+
+
+def are_close(x, y):
+    return abs(x - y) < 0.00001
 
 
 def sharey(axes):
@@ -291,7 +324,7 @@ def normalize(a, new_min=0.0, new_max=1.0):
     return n * (new_max - new_min) + new_min
 
 
-def moving_average(self, length, mode='valid'):
+def moving_average(a, length, mode='valid'):
     """
     From ``bruges``
 
@@ -300,10 +333,11 @@ def moving_average(self, length, mode='valid'):
     Example:
         >>> test = np.array([1,9,9,9,9,9,9,2,3,9,2,2,3,1,1,1,1,3,4,9,9,9,8,3])
         >>> moving_average(test, 7, mode='same')
-        [ 4.4285714  5.571428  6.7142857  7.8571428  8.          7.1428571
-          7.1428571  6.142857  5.1428571  4.2857142  3.1428571  3.
-          2.7142857  1.571428  1.7142857  2.          2.857142  4.
-          5.1428571  6.142857  6.4285714  6.1428571  5.7142857  4.5714285 ]
+        [ 4.42857143,  5.57142857,  6.71428571,  7.85714286,  8.        ,
+        7.14285714,  7.14285714,  6.14285714,  5.14285714,  4.28571429,
+        3.14285714,  3.        ,  2.71428571,  1.57142857,  1.71428571,
+        2.        ,  2.85714286,  4.        ,  5.14285714,  6.14285714,
+        6.42857143,  6.42857143,  6.28571429,  5.42857143]
 
     TODO:
         Other types of average.
@@ -312,12 +346,13 @@ def moving_average(self, length, mode='valid'):
 
     if mode == 'full':
         pad *= 2
+    pad = int(pad)
 
     # Make a padded version, paddding with first and last values
-    r = np.empty(self.shape[0] + 2*pad)
-    r[:pad] = self[0]
-    r[pad:-pad] = self
-    r[-pad:] = self[-1]
+    r = np.zeros(a.shape[0] + 2*pad)
+    r[:pad] = a[0]
+    r[pad:-pad] = a
+    r[-pad:] = a[-1]
 
     # Cumsum with shifting trick
     s = np.cumsum(r, dtype=float)
@@ -326,7 +361,7 @@ def moving_average(self, length, mode='valid'):
 
     # Decide what to return
     if mode == 'same':
-        if out.shape[0] != self.shape[0]:
+        if out.shape[0] != a.shape[0]:
             # If size doesn't match, then interpolate.
             out = (out[:-1, ...] + out[1:, ...]) / 2
         return out
@@ -336,31 +371,14 @@ def moving_average(self, length, mode='valid'):
         return out
 
 
-def moving_avg_conv(self, length):
+def moving_avg_conv(a, length):
     """
     From ``bruges``
 
     Moving average via convolution. Seems slower than naive.
     """
     boxcar = np.ones(length)/length
-    return np.convolve(self, boxcar, mode="same")
-
-
-def normalize(a, new_min=0.0, new_max=1.0):
-    """
-    From ``bruges``
-
-    Normalize an array to [0,1] or to
-    arbitrary new min and max.
-
-    :param a: An array.
-    :param new_min: A float to be the new min, default 0.
-    :param new_max: A float to be the new max, default 1.
-
-    :returns: The normalized array.
-    """
-    n = (a - np.amin(a)) / np.amax(a - np.amin(a))
-    return n * (new_max - new_min) + new_min
+    return np.convolve(a, boxcar, mode="same")
 
 
 def top_and_tail(*arrays):
@@ -399,13 +417,111 @@ def extrapolate(a):
 
 def dms2dd(dms):
     """
-    d must be negative for S and W.
+    DMS to decimal degrees.
+
+    Args:
+        dms (list). d must be negative for S and W.
+
+    Return:
+        float.
     """
     d, m, s = dms
     return d + m/60. + s/3600.
 
 
 def dd2dms(dd):
+    """
+    Decimal degrees to DMS.
+
+    Args:
+        dd (float). Decimal degrees.
+
+    Return:
+        tuple. Degrees, minutes, and seconds.
+    """
     m, s = divmod(dd * 3600, 60)
     d, m = divmod(m, 60)
     return int(d), int(m), s
+
+
+def ricker(f, length, dt):
+    """
+    A Ricker wavelet.
+
+    Args:
+        f (float): frequency in Haz, e.g. 25 Hz.
+        length (float): Length in s, e.g. 0.128.
+        dt (float): sample interval in s, e.g. 0.001.
+
+    Returns:
+        tuple. time basis, amplitude values.
+    """
+    t = np.linspace(-length/2, (length-dt)/2, length/dt)
+    y = (1. - 2.*(np.pi**2)*(f**2)*(t**2))*np.exp(-(np.pi**2)*(f**2)*(t**2))
+    return t, y
+
+
+def hex_to_rgb(hexx):
+    """
+    Utility function to convert hex to (r,g,b) triples.
+    http://ageo.co/1CFxXpO
+
+    Args:
+        hexx (str): A hexadecimal colour, starting with '#'.
+
+    Returns:
+        tuple: The equivalent RGB triple, in the range 0 to 255.
+    """
+    h = hexx.strip('#')
+    l = len(h)
+
+    return tuple(int(h[i:i+l//3], 16) for i in range(0, l, l//3))
+
+
+def hex_is_dark(hexx, percent=50):
+    """
+    Function to decide if a hex colour is dark.
+
+    Args:
+        hexx (str): A hexadecimal colour, starting with '#'.
+
+    Returns:
+        bool: The colour's brightness is less than the given percent.
+    """
+    r, g, b = hex_to_rgb(hexx)
+    luma = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 2.55  # per ITU-R BT.709
+
+    return (luma < percent)
+
+
+def text_colour_for_hex(hexx, percent=50, dark='#000000', light='#ffffff'):
+    """
+    Function to decide what colour to use for a given hex colour.
+
+    Args:
+        hexx (str): A hexadecimal colour, starting with '#'.
+
+    Returns:
+        bool: The colour's brightness is less than the given percent.
+    """
+    return light if hex_is_dark(hexx, percent=percent) else dark
+
+
+def get_lines(handle, line):
+    """
+    Get zero-indexed line from an open file-like.
+    """
+    for i, l in enumerate(handle):
+        if i == line:
+            return l
+
+
+def find_file(pattern, path):
+    """
+    A bit like grep. Finds a pattern, looking in path. Returns the filename.
+    """
+    for fname in glob.iglob(path):
+        with open(fname) as f:
+            if re.search(pattern, f.read()):
+                return fname
+    return

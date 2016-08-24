@@ -6,7 +6,9 @@ Defines wells.
 :copyright: 2016 Agile Geoscience
 :license: Apache 2.0
 """
+import re
 import datetime
+from io import StringIO
 
 import matplotlib.pyplot as plt
 import matplotlib as mpl
@@ -18,6 +20,11 @@ from .fields import las_fields
 from .curve import Curve
 from .header import Header
 from .location import Location
+from .synthetic import Synthetic
+from .canstrat import well_to_card_1
+from .canstrat import well_to_card_2
+from .canstrat import interval_to_card_7
+from .canstrat import write_row
 
 ###############################################
 # This module is not used directly, but must
@@ -48,6 +55,16 @@ class Well(object):
         if getattr(self, 'data', None) is None:
             self.data = {}
 
+        if getattr(self, 'header', None) is None:
+            self.header = Header({})
+
+    def __eq__(self, other):
+        if (not self.uwi) or (not other.uwi):
+            raise WellError("One or both UWIs is blank, cannot determine equality.")
+        if self.uwi == other.uwi:
+            return True
+        return False
+
     def _repr_html_(self):
         """
         Jupyter Notebook magic repr function.
@@ -61,10 +78,12 @@ class Well(object):
             for k, v in self.location.__dict__.items():
                 if k in ['deviation', 'position']:
                     continue
+                if k == 'crs':
+                    v = v.__repr__()
                 rows += s.format(k=k, v=v)
 
         if getattr(self, 'data', None) is not None:
-            rows += s.format(k="data", v=list(self.data.keys()))
+            rows += s.format(k="data", v=', '.join(sorted(list(self.data.keys()))))
 
         html = '<table>{}</table>'.format(rows)
         return html
@@ -101,8 +120,9 @@ class Well(object):
                                                   remap=remap,
                                                   funcs=funcs)
 
+        depth_curves = ['DEPT', 'DEPTH', 'TIME']
         curves = {c.mnemonic: Curve.from_lasio_curve(c, **curve_params)
-                  for c in l.curves}
+                  for c in l.curves if c.mnemonic not in depth_curves}
 
         # Build a dict of the other well data.
         params = {'las': l,
@@ -193,7 +213,8 @@ class Well(object):
             try:
                 new_data = np.copy(d.to_basis_like(basis))
             except:
-                raise WellError("basis shift failed")
+                # Basis shift failed; is probably not a curve
+                pass
             try:
                 descr = d.description
                 l.add_curve(k.upper(), new_data, unit=d.units, descr=descr)
@@ -246,10 +267,19 @@ class Well(object):
         Returns:
             None. Works in place.
         """
-        l = lasio.read(fname)
+        try:  # To treat as a single file
+            self.add_curves_from_lasio(lasio.read(fname),
+                                       remap=remap,
+                                       funcs=funcs
+                                       )
+        except:  # It's a list!
+            for f in fname:
+                self.add_curves_from_lasio(lasio.read(f),
+                                           remap=remap,
+                                           funcs=funcs
+                                           )
 
-        # Pass to other constructor.
-        return self.add_curves_from_lasio(l, remap=remap, funcs=funcs)
+        return None
 
     def add_curves_from_lasio(self, l, remap=None, funcs=None):
         """
@@ -348,8 +378,10 @@ class Well(object):
              legend=None,
              tracks=None,
              track_titles=None,
+             alias=None,
              basis=None,
-             return_fig=False):
+             return_fig=False,
+             extents='td'):
         """
         Plot multiple tracks.
 
@@ -365,6 +397,11 @@ class Well(object):
                 want welly to guess (probably the best idea).
             return_fig (bool): Whether to return the matplotlig figure. Default
                 False.
+            extents (str): What to use for the y limits:
+                'td' — plot 0 to TD.
+                'curves' — use a basis that accommodates all the curves.
+                'all' — use a basis that accommodates everything.
+                (tuple) — give the upper and lower explictly.
 
         Returns:
             None. The plot is a side-effect.
@@ -379,7 +416,20 @@ class Well(object):
         # Figure out limits
         if basis is None:
             basis = self.survey_basis(keys=tracks)
-        upper, lower = basis[0], basis[-1]
+
+        if extents == 'curves':
+            upper, lower = basis[0], basis[-1]
+        elif extents == 'td':
+            upper, lower = 0, self.location.td
+            if not lower:
+                lower = basis[-1]
+        elif extents == 'all':
+            raise NotImplementedError("You cannot do that yet.")
+        else:
+            try:
+                upper, lower = extents
+            except:
+                upper, lower = basis[0], basis[-1]
 
         # Figure out widths because we can't us gs.update() for that.
         widths = [0.4 if t in depth_tracks else 1.0 for t in tracks]
@@ -387,7 +437,8 @@ class Well(object):
         # Set up the figure.
         ntracks = len(tracks)
         fig = plt.figure(figsize=(2*ntracks, 12), facecolor='w')
-        fig.suptitle(self.header.name, size=16)
+        fig.suptitle(self.header.name, size=16, zorder=100,
+                     bbox=dict(facecolor='w', alpha=1.0, ec='none'))
         gs = mpl.gridspec.GridSpec(1, ntracks, width_ratios=widths)
 
         # Plot first axis.
@@ -401,10 +452,10 @@ class Well(object):
             ax0 = self._plot_depth_track(ax=ax0, md=basis, kind=track)
         else:
             try:  # ...treating as a plottable object.
-                ax0 = self.data[track].plot(ax=ax0, legend=legend, **kwargs)
+                ax0 = self.get_curve(track, alias=alias).plot(ax=ax0, legend=legend, **kwargs)
             except TypeError:  # ...it's a list.
                 for t in track:
-                    ax0 = self.data[t].plot(ax=ax0, legend=legend, **kwargs)
+                    ax0 = self.get_curve(t, alias=alias).plot(ax=ax0, legend=legend, **kwargs)
         tx = ax0.get_xticks()
         ax0.set_xticks(tx[1:-1])
         ax0.set_title(track_titles[0])
@@ -414,25 +465,27 @@ class Well(object):
             kwargs = {}
             ax = fig.add_subplot(gs[0, i+1])
             ax.depth_track = False
-            ax.set_title(track_titles[i+1])
             if track in depth_tracks:
                 ax = self._plot_depth_track(ax=ax, md=basis, kind=track)
                 continue
             if '.' in track:
                 track, kwargs['field'] = track.split('.')
             plt.setp(ax.get_yticklabels(), visible=False)
-            try:  # ...treating as a plottable objectself.
-                ax = self.data[track].plot(ax=ax, legend=legend, **kwargs)
+            try:  # ...treating as a plottable object.
+                ax = self.get_curve(track, alias=alias).plot(ax=ax, legend=legend, **kwargs)
             except TypeError:  # ...it's a list.
-                for t in track:
+                for j, t in enumerate(track):
                     if '.' in t:
                         track, kwargs['field'] = track.split('.')
                     try:
-                        ax = self.data[t].plot(ax=ax, legend=legend, **kwargs)
+                        ax = self.get_curve(t, alias=alias).plot(ax=ax, legend=legend, **kwargs)
                     except KeyError:
                         continue
+
             tx = ax.get_xticks()
             ax.set_xticks(tx[1:-1])
+            ax.set_title(track_titles[i+1])
+            # ax.title.set_visible(False)  # turn off "Title" because we're using text
 
         # Set sharing.
         axes = fig.get_axes()
@@ -487,3 +540,318 @@ class Well(object):
             return np.arange(min(starts), max(stops)+1e-9, min(steps))
         else:
             return None
+
+    def unify_basis(self, keys=None):
+        """
+        Give everything, or everything in the list of keys, the same basis.
+        Args:
+            keys (list): List of strings: the keys of the data items to
+                unify, if not all of them.
+
+        Returns:
+            None. Works in place.
+        """
+        basis = self.survey_basis(keys=keys)
+        if basis is None:
+            raise WellError("Could not retrieve common basis.")
+
+        for k in self.data:
+            if (keys is not None) and (k not in keys):
+                continue
+            try:  # To treat as a curve.
+                self.data[k] = self.data[k].to_basis(basis)
+            except:  # It's probably a striplog.
+                continue
+
+        return
+
+    def get_mnemonics_from_regex(self, pattern):
+        """
+        Should probably integrate getting curves with regex, vs getting with
+        aliases, even though mixing them is probably confusing. For now I can't
+        think of another use case for these wildcards, so I'll just implement
+        for the curve table and we can worry about a nice solution later if we
+        ever come back to it.
+        """
+        regex = re.compile(pattern)
+        keys = self.data.keys()
+        return [m.group(0) for k in keys for m in [regex.search(k)] if m]
+
+    def get_mnemonic(self, mnemonic, alias=None):
+        """
+        Instead of picking curves by name directly from the data dict, you
+        can pick them up with this method, which takes account of the alias
+        dict you pass it. If you do not pass an alias dict, then you get the
+        curve you asked for, if it exists, or None. NB Wells do not have alias
+        dicts, but Projects do.
+
+        Args:
+            mnemonic (str): the name of the curve you want.
+            alias (dict): an alias dictionary, like welly.
+
+        Returns:
+            Curve.
+        """
+        alias = alias or {}
+        aliases = alias.get(mnemonic, [mnemonic])
+        for a in aliases:
+            if a in self.data:
+                return a
+        return None
+
+    def get_curve(self, mnemonic, alias=None):
+        """
+        Wraps get_mnemonic.
+
+        Instead of picking curves by name directly from the data dict, you
+        can pick them up with this method, which takes account of the alias
+        dict you pass it. If you do not pass an alias dict, then you get the
+        curve you asked for, if it exists, or None. NB Wells do not have alias
+        dicts, but Projects do.
+
+        Args:
+            mnemonic (str): the name of the curve you want.
+            alias (dict): an alias dictionary, like welly.
+
+        Returns:
+            Curve.
+        """
+        return self.data.get(self.get_mnemonic(mnemonic, alias=alias), None)
+
+    def count_curves(self, keys, alias=None):
+        """
+        Counts the number of curves in the well that will be selected with the
+        given key list and the given alias dict. Use by Project's curve table.
+        """
+        return len(list(filter(None, [self.get_mnemonic(k, alias=alias) for k in keys])))
+
+    def alias_has_multiple(self, mnemonic, alias):
+        return 1 < len([a for a in alias[mnemonic] if a in self.data])
+
+    def make_synthetic(self,
+                       srd=0,
+                       v_repl_seismic=2000,
+                       v_repl_log=2000,
+                       f=50,
+                       dt=0.001):
+        """
+        Early hack. Use with extreme caution.
+
+        Hands-free. There'll be a more granualr version in synthetic.py.
+
+        Assumes DT is in µs/m and RHOB is kg/m3.
+
+        There is no handling yet for TVD.
+
+        The datum handling is probably sketchy.
+
+        TODO:
+            A lot.
+        """
+        kb = getattr(self.location, 'kb', None) or 0
+        data0 = self.data['DT'].start
+        log_start_time = ((srd - kb) / v_repl_seismic) + (data0 / v_repl_log)
+
+        # Basic log values.
+        dt_log = self.data['DT'].despike()  # assume µs/m
+        rho_log = self.data['RHOB'].despike()  # assume kg/m3
+        if not np.allclose(dt_log.basis, rho_log.basis):
+            rho_log = rho_log.to_basis_like(dt_log)
+        Z = (1e6 / dt_log) * rho_log
+
+        # Two-way-time.
+        scaled_dt = dt_log.step * np.nan_to_num(dt_log) / 1e6
+        twt = 2 * np.cumsum(scaled_dt)
+        t = twt + log_start_time
+
+        # Move to time.
+        t_max = t[-1] + 10*dt
+        t_reg = np.arange(0, t_max+1e-9, dt)
+        Z_t = np.interp(x=t_reg, xp=t, fp=Z)
+
+        # Make RC series.
+        rc_t = (Z_t[1:] - Z_t[:-1]) / (Z_t[1:] + Z_t[:-1])
+        rc_t = np.nan_to_num(rc_t)
+
+        # Convolve.
+        _, ricker = utils.ricker(f=f, length=0.128, dt=dt)
+        synth = np.convolve(ricker, rc_t, mode='same')
+
+        params = {'dt': dt,
+                  'z start': dt_log.start,
+                  'z stop': dt_log.stop
+                  }
+
+        self.data['Synthetic'] = Synthetic(synth, basis=t_reg, params=params)
+
+        return None
+
+    def qc_data(self, tests, alias=None):
+        """
+        Run a series of tests against the data and return the corresponding
+        results.
+
+        Args:
+            tests (list): a list of functions.
+
+        Returns:
+            list. The results. Stick to booleans (True = pass) or ints.
+        """
+        return {m: c.quality(tests, alias or {}) for m, c in self.data.items()}
+
+    def qc_table_html(self, tests, alias=None):
+        """
+        Makes a nice table out of ``qc_data()``
+        """
+        data = self.qc_data(tests, alias=alias)
+        all_tests = [list(d.keys()) for d in data.values()]
+        tests = list(set(utils.flatten_list(all_tests)))
+
+        # Header row.
+        r = '</th><th>'.join(['UWI', 'Passed', 'Score'] + tests)
+        rows = '<tr><th>{}</th></tr>'.format(r)
+
+        styles = {
+            True: "#CCEECC",
+            False: "#FFCCCC",
+        }
+
+        # Quality results.
+        for curve, results in data.items():
+
+            if results:
+                norm_score = sum(results.values()) / len(results)
+            else:
+                norm_score = -1
+
+            rows += '<tr><th>{}</th>'.format(curve)
+            rows += '<td>{} / {}</td>'.format(sum(results.values()), len(results))
+            rows += '<td>{:.3f}</td>'.format(norm_score)
+
+            for test in tests:
+                result = results.get(test, '')
+                style = styles.get(result, "#EEEEEE")
+                rows += '<td style="background-color:{};">'.format(style)
+                rows += '{}</td>'.format(result)
+            rows += '</tr>'
+
+        html = '<table>{}</table>'.format(rows)
+        return html
+
+    def to_canstrat(self, key, log, filename=None, as_text=False):
+        """
+        Make a Canstrat DAT (aka ASCII) file.
+
+        TODO:
+            The data part should probably belong to striplog, and only the
+            header should be written by the well.
+
+        Args:
+           filename (str)
+           key (str)
+           log (str): the log name, should be 6 characters.
+           as_text (bool): if you don't want to write a file.
+        """
+        if (filename is None):
+            if (not as_text):
+                raise WellError("You must provide a filename or set as_text to True.")
+
+        strip = self.data[key]
+        strip = strip.fill()  # Default is to fill with 'null' intervals.
+
+        record = {1: [well_to_card_1(self)],
+                  2: [well_to_card_2(self, key)],
+                  8: [],
+                  7: [interval_to_card_7(iv) for iv in strip]
+                 }
+
+        result = ''
+        for c in [1,2,8,7]:
+            for d in record[c]:
+                result += write_row(d, card=c, log=log)
+
+        if as_text:
+            return result
+        else:
+            with open(filename, 'w') as f:
+                f.write(result)
+            return None
+
+    def data_as_matrix(self, keys=None,
+                       return_basis=False,
+                       basis=None,
+                       window_length=None,
+                       step=1,
+                       alias=None):
+        """
+        Provide a feature matrix, given a list of data items.
+
+        I think this will probably fail if there are striplogs in the data
+        dictionary for this well.
+
+
+
+        TODO:
+            Deal with striplogs and other data, if present.
+
+        Args:
+            keys (list): List of the logs to export from the data dictionary.
+            return_basis (bool): Whether or not to return the basis that was
+                used.
+            basis (ndarray): The basis to use.
+            window (int): The number of samples to return around each sample.
+
+        """
+        if keys is None:
+            keys = list(self.data.keys())
+        else:
+            # Only look at the alias list if keys were passed.
+            if alias is not None:
+                _keys = []
+                for k in keys:
+                    if k in alias:
+                        added = False
+                        for a in alias[k]:
+                            if a in self.data:
+                                _keys.append(a)
+                                added = True
+                                break
+                        if not added:
+                            _keys.append(k)
+                    else:
+                        _keys.append(k)
+                # print("You asked for {}".format(keys))
+                # print("You are getting {}".format(_keys))
+                keys = _keys
+
+        if basis is None:
+            basis = self.survey_basis(keys=keys)
+
+        # Get the data, or None is curve is missing.
+        data = [self.data.get(k) for k in keys]
+
+        # Now cast to the correct basis, and replace any missing curves with
+        # an empty Curve. The sklearn imputer will deal with it. We will change
+        # the elements in place.
+        for i, d in enumerate(data):
+            if d is not None:
+                data[i] = d.to_basis(basis=basis)
+            else:
+                # Empty_like gives unpredictable results
+                data[i] = Curve(np.full(basis.shape, np.nan), basis=basis)
+
+        if window_length is not None:
+            d_new = []
+            for d in data:
+                r = d._rolling_window(window_length,
+                                         func1d=utils.null,
+                                         step=step,
+                                         return_rolled=False,
+                                         )
+                d_new.append(r.T)
+            data = d_new
+
+        if return_basis:
+            return np.vstack(data).T, basis
+        else:
+            return np.vstack(data).T
