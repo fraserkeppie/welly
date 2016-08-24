@@ -331,6 +331,19 @@ class Well(object):
 
         return ax
 
+    def plotWithPlotter(self, config=None, plotter=None):
+        """
+        Plot with plotter.
+        
+        Args:
+            plotter: An object configure and plot functions 
+            (i.e., assuming duck-typing, these are the essential 
+            functions of a plotter object)
+        """
+        if plotter is not None:
+            plotter.configure(config)
+            plotter.plot(self)
+
     def plot(self,
              legend=None,
              tracks=None,
